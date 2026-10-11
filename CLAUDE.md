@@ -87,7 +87,21 @@ daemons coexist.
   sessions, spawn as reserve → spawn → commit (`in_flight`/`to_kill`), kill,
   `respawn` (Alt+e; a reserved transition, so a concurrent Kill wins), and
   `close_exited` (a clean claude exit, or any shell exit, removes the session
-  unless something replaced it meanwhile).
+  unless something replaced it meanwhile). `Config::claude_bin()` resolves
+  claude on every use: `$CLAUDIO_CLAUDE_PATH` if set, else `claude` in
+  `Config::path`, then well-known install dirs (`~/.local/bin`,
+  `~/.npm-packages/bin`, …).
+- `login_path.rs` — at daemon start, runs the user's login shell (`$SHELL
+  -l -i -c`, setsid, stdin `/dev/null`, 3 s deadline, group killed on
+  timeout) and reads its `PATH` between markers. It is merged with the
+  inherited `PATH` (login first) into `Config::path`. A daemon started over
+  ssh only has the system `PATH`, which can find a stale `/usr/local/bin/claude`.
+  `Config::path` is used to find claude, and is the `PATH` of every session,
+  terminal, `claude --version/--help` probe and `claude update`. A spec's own
+  `PATH` still wins. On failure the inherited `PATH` stays. Tests never read
+  real rc files. Unit tests use fake shell scripts, daemon tests build
+  `Config` directly, and the manager harness pins `SHELL=/bin/sh` with a temp
+  `HOME`.
 - `server.rs` — accepts Unix socket connections, uid-checks peers, runs the
   per-client loop. Slow requests (git, `UpdateClaude`, attach) reply from
   spawned tasks through the client's queue, never inline.
@@ -117,7 +131,8 @@ daemons coexist.
 - `update.rs` — `claude update` (or the official installer) on request, in its
   own process group, killed as a group on timeout.
 - `host.rs`, `stats.rs` — host facts for `Welcome`, directory listing, CPU and
-  memory samples. `ctl.rs` — `claudio daemon status|stop|restart`.
+  memory samples. `ctl.rs` — `claudio daemon status|stop|restart` (status
+  shows the claude path and version the daemon uses).
 
 **`client.rs`** — generic client connection and local daemon autostart.
 Connects to the socket; if unavailable, starts the daemon (double-fork +

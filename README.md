@@ -225,6 +225,8 @@ SSH hosts come from `~/.config/claudio/hosts.json` (most recently used first) an
 
 Requirements: key or agent SSH authentication (no password prompts), and `claude` on the remote. claudio offers to install `claude` there if it is missing.
 
+claudio runs the `claude` your login shell finds. The daemon asks your shell for its `PATH` when it starts (`$SHELL -l -i`, so `~/.zshrc` or `~/.bashrc` apply), uses it to find `claude`, and gives that `PATH` to every session and terminal. If you have more than one claude installed, the first one on your interactive `PATH` wins. To pin one, set `CLAUDIO_CLAUDE_PATH`. `claudio daemon status` shows which claude a host's daemon uses.
+
 ---
 
 ## Drop-in `-p` and the API server
