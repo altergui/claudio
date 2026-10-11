@@ -59,6 +59,14 @@ fn wait_for_daemon_exit(timeout: Duration) -> bool {
     }
 }
 
+/// The claude the daemon runs, as `daemon status` prints it.
+fn claude_line(claude: Option<&proto::ClaudeInfo>) -> String {
+    match claude {
+        Some(c) => format!("{}, {}", c.path, c.version),
+        None => "not found".to_owned(),
+    }
+}
+
 // ── subcommands ───────────────────────────────────────────────────────────────
 
 pub fn daemon_status() -> std::process::ExitCode {
@@ -87,8 +95,9 @@ pub fn daemon_status() -> std::process::ExitCode {
     rt.block_on(async {
         match client::connect(&paths::daemon_socket()).await {
             Ok(c) => {
-                let version = &c.welcome().claudio_version;
-                println!("version: {version}");
+                let welcome = c.welcome();
+                println!("version: {}", welcome.claudio_version);
+                println!("claude: {}", claude_line(welcome.host.claude.as_ref()));
                 match c.request(proto::Msg::ListSessions).await {
                     Ok(proto::Msg::Sessions { sessions }) => {
                         println!("sessions: {}", sessions.len());
@@ -266,6 +275,19 @@ fn verify_daemon_pid_linux(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_shows_claude_version_and_path() {
+        let info = proto::ClaudeInfo {
+            path: "/home/u/.npm-packages/bin/claude".into(),
+            version: "2.1.296 (Claude Code)".into(),
+        };
+        assert_eq!(
+            claude_line(Some(&info)),
+            "/home/u/.npm-packages/bin/claude, 2.1.296 (Claude Code)"
+        );
+        assert_eq!(claude_line(None), "not found");
+    }
 
     #[test]
     fn verify_own_pid_matches() {

@@ -108,6 +108,7 @@ impl TestDaemon {
             claudio: PathBuf::from("/bin/true"),
             skip_permissions: true,
             build: None,
+            path: None,
         }
     }
 
@@ -763,6 +764,7 @@ async fn resume_retry_spawns_fresh_on_quick_exit() {
         claudio: PathBuf::from("/bin/true"),
         skip_permissions: true,
         build: None,
+        path: None,
     };
     // Pre-populate a journal entry with a claude_session_id so the spawn
     // request carries --resume.
@@ -876,6 +878,7 @@ async fn immediate_exit_leaves_session_dormant() {
         claudio: PathBuf::from("/bin/true"),
         skip_permissions: true,
         build: None,
+        path: None,
     };
 
     let listening = server::start(config).unwrap().expect("lock is free");
@@ -1204,6 +1207,7 @@ async fn spawn_for_a_journaled_shell_starts_a_shell() {
 }
 mod freshness;
 mod git;
+mod login_path;
 
 // ── Respawn (reset a session in place) ───────────────────────────────────────
 

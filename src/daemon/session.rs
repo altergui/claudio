@@ -16,6 +16,7 @@
 //! therefore never blocks the PTY.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -171,14 +172,22 @@ pub fn spawn(
         )));
     }
     let token = hooks::new_token();
+    let path = daemon.config.path.as_deref();
     let (cmd, program) = match kind {
-        SessionKind::Claude => (
-            command(&daemon.config, spec, &cwd, &token, daemon.skip_permissions()),
-            daemon.config.claude.clone(),
-        ),
+        SessionKind::Claude => {
+            let cmd = command(
+                &daemon.config,
+                spec,
+                &cwd,
+                &token,
+                daemon.skip_permissions(),
+            );
+            let program = PathBuf::from(cmd.get_argv()[0].clone());
+            (cmd, program)
+        }
         SessionKind::Shell => {
-            let shell = login_shell();
-            (shell_command(&shell, &cwd), shell)
+            let shell = super::login_path::login_shell();
+            (shell_command(&shell, &cwd, path), shell)
         }
     };
     let (rows, cols) = size_or_default(spec.rows, spec.cols);
@@ -280,21 +289,25 @@ fn command(
         cmd.arg(name);
     }
     cmd.cwd(cwd);
-    apply_env(&mut cmd, &spec.env);
+    apply_env(&mut cmd, cfg.path.as_deref(), &spec.env);
     cmd
 }
 
 /// Start from the daemon's env (the builder's default), apply the shared
 /// [`env_diff`] (scrubs what would leak from a daemon started inside claude;
-/// a proxy token replaces any API key), set the terminal type, then set the
-/// spec's env.
-fn apply_env(cmd: &mut CommandBuilder, env: &[(String, String)]) {
+/// a proxy token replaces any API key), set the terminal type and the
+/// daemon's login-shell `PATH` ([`super::Config::path`]), then set the spec's
+/// env (an explicit `PATH` there wins).
+fn apply_env(cmd: &mut CommandBuilder, path: Option<&OsStr>, env: &[(String, String)]) {
     let diff = env_diff(env);
     for key in diff.remove {
         cmd.env_remove(key);
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
     for (k, v) in diff.set {
         cmd.env(k, v);
     }
@@ -303,49 +316,12 @@ fn apply_env(cmd: &mut CommandBuilder, env: &[(String, String)]) {
 /// `<shell> -l` in `cwd`: a plain terminal. No hooks, no proxy env, and the
 /// claude session markers are scrubbed so a `claude` typed into it is a
 /// top-level session, not a child of whatever started the daemon.
-fn shell_command(shell: &Path, cwd: &Path) -> CommandBuilder {
+fn shell_command(shell: &Path, cwd: &Path, path: Option<&OsStr>) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(shell);
     cmd.arg("-l");
     cmd.cwd(cwd);
-    apply_env(&mut cmd, &[]);
+    apply_env(&mut cmd, path, &[]);
     cmd
-}
-
-/// The user's login shell: `$SHELL`, else the passwd entry's, else `/bin/sh`.
-fn login_shell() -> PathBuf {
-    std::env::var_os("SHELL")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(passwd_shell)
-        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
-}
-
-#[cfg(unix)]
-fn passwd_shell() -> Option<PathBuf> {
-    // SAFETY: `getpwuid_r` fills `pw` and `buf` and nothing else; `pw_shell`
-    // points into `buf`, which outlives the copy below.
-    let shell = unsafe {
-        let mut pw: libc::passwd = std::mem::zeroed();
-        let mut buf = [0 as libc::c_char; 2048];
-        let mut found = std::ptr::null_mut();
-        let rc = libc::getpwuid_r(
-            libc::getuid(),
-            &mut pw,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut found,
-        );
-        if rc != 0 || found.is_null() || pw.pw_shell.is_null() {
-            return None;
-        }
-        std::ffi::CStr::from_ptr(pw.pw_shell).to_str().ok()?.to_owned()
-    };
-    (!shell.is_empty()).then(|| PathBuf::from(shell))
-}
-
-#[cfg(not(unix))]
-fn passwd_shell() -> Option<PathBuf> {
-    None
 }
 
 /// claude animates its terminal title with a leading status glyph
@@ -946,7 +922,6 @@ mod tests {
     }
 
     use super::*;
-    use std::ffi::OsStr;
 
     #[test]
     fn full_queue_lags_then_resyncs_with_pending_req() {
@@ -1023,7 +998,11 @@ mod tests {
         cmd.env("CLAUDE_CODE_CHILD_SESSION", "1");
         cmd.env("CLAUDE_CODE_USE_GATEWAY", "1");
         cmd.env("ANTHROPIC_API_KEY", "old");
-        apply_env(&mut cmd, &[("ANTHROPIC_AUTH_TOKEN".into(), "tok".into())]);
+        apply_env(
+            &mut cmd,
+            None,
+            &[("ANTHROPIC_AUTH_TOKEN".into(), "tok".into())],
+        );
         assert_eq!(cmd.get_env("CLAUDECODE"), None);
         assert_eq!(cmd.get_env("CLAUDE_CODE_ENTRYPOINT"), None);
         assert_eq!(cmd.get_env("CLAUDE_CODE_CHILD_SESSION"), None);
@@ -1041,7 +1020,7 @@ mod tests {
 
     #[test]
     fn shell_command_is_a_plain_login_shell() {
-        let cmd = shell_command(Path::new("/bin/zsh"), Path::new("/tmp"));
+        let cmd = shell_command(Path::new("/bin/zsh"), Path::new("/tmp"), None);
         let argv: Vec<_> = cmd
             .get_argv()
             .iter()
@@ -1054,10 +1033,39 @@ mod tests {
     }
 
     #[test]
+    fn login_path_is_set_unless_the_spec_sets_one() {
+        let login = OsStr::new("/home/u/.npm-packages/bin:/usr/bin");
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.env("PATH", "/usr/bin");
+        // A proxy env (no PATH of its own) keeps the login PATH.
+        apply_env(
+            &mut cmd,
+            Some(login),
+            &[("ANTHROPIC_AUTH_TOKEN".into(), "t".into())],
+        );
+        assert_eq!(cmd.get_env("PATH"), Some(login));
+        let mut cmd = CommandBuilder::new("claude");
+        apply_env(
+            &mut cmd,
+            Some(login),
+            &[("PATH".into(), "/explicit".into())],
+        );
+        assert_eq!(cmd.get_env("PATH"), Some(OsStr::new("/explicit")));
+        // Without a login PATH, the daemon's own stays.
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.env("PATH", "/usr/bin");
+        apply_env(&mut cmd, None, &[]);
+        assert_eq!(cmd.get_env("PATH"), Some(OsStr::new("/usr/bin")));
+        // Terminals get it too.
+        let cmd = shell_command(Path::new("/bin/sh"), Path::new("/tmp"), Some(login));
+        assert_eq!(cmd.get_env("PATH"), Some(login));
+    }
+
+    #[test]
     fn api_key_kept_without_auth_token() {
         let mut cmd = CommandBuilder::new("claude");
         cmd.env("ANTHROPIC_API_KEY", "key");
-        apply_env(&mut cmd, &[]);
+        apply_env(&mut cmd, None, &[]);
         assert_eq!(cmd.get_env("ANTHROPIC_API_KEY"), Some(OsStr::new("key")));
     }
 
@@ -1071,6 +1079,7 @@ mod tests {
             claudio: "/bin/claudio".into(),
             skip_permissions: true,
             build: None,
+            path: None,
         };
         let spec = SpawnSpec {
             id: uuid::Uuid::nil(),
@@ -1122,6 +1131,7 @@ mod tests {
             claudio: "/bin/claudio".into(),
             skip_permissions: true,
             build: None,
+            path: None,
         };
         for given in [ALLOW, "--dangerously-skip-permissions"] {
             let spec = SpawnSpec {

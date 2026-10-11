@@ -10,6 +10,7 @@
 //! - [`host`] — host facts for `Welcome`, directory listing.
 //! - [`update`] — `claude update` (or the installer), on request.
 //! - [`git`] — the read-only git queries behind the TUI's git viewer.
+//! - [`login_path`] — the user's login-shell `PATH`, for claude and sessions.
 //!
 //! This module holds the shared [`Daemon`] state: the registry of journaled
 //! and live sessions, and the all-clients event broadcast.
@@ -19,6 +20,7 @@ mod git;
 mod git_status;
 mod host;
 mod journal;
+mod login_path;
 mod server;
 mod session;
 mod stats;
@@ -27,8 +29,9 @@ mod update;
 mod tests;
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -62,7 +65,8 @@ pub struct Config {
     pub lock: PathBuf,
     /// The session journal.
     pub journal: PathBuf,
-    /// The claude binary (`$CLAUDIO_CLAUDE_PATH`, else `claude` from `PATH`).
+    /// The claude binary: `$CLAUDIO_CLAUDE_PATH` as given, else the bare
+    /// name `claude`, looked up afresh on each use ([`Config::claude_bin`]).
     pub claude: PathBuf,
     /// This binary, used as the hook relay command.
     pub claudio: PathBuf,
@@ -73,104 +77,196 @@ pub struct Config {
     /// so clients can tell an outdated daemon; see [`crate::freshness`]).
     /// `None` when it could not be read.
     pub build: Option<Probe>,
+    /// The `PATH` claude is looked up in and every session runs with: the
+    /// user's login-shell `PATH` merged with the inherited one
+    /// ([`login_path`]). `None` keeps the daemon's own `PATH`.
+    pub path: Option<OsString>,
 }
 
 impl Config {
-    /// The standard locations from [`paths`].
+    /// The standard locations from [`paths`]. Asks the login shell for its
+    /// `PATH` (≤ [`login_path::TIMEOUT`]).
     pub fn from_env() -> io::Result<Config> {
-        let claude = std::env::var_os("CLAUDIO_CLAUDE_PATH")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(resolve_claude_path);
+        let inherited = std::env::var_os("PATH");
+        let path = login_path::resolve(
+            &login_path::login_shell(),
+            inherited.as_deref(),
+            login_path::TIMEOUT,
+        );
         Ok(Config {
             socket: paths::daemon_socket(),
             lock: paths::daemon_lock(),
             journal: paths::daemon_journal(),
-            claude,
+            claude: claude_setting(std::env::var_os("CLAUDIO_CLAUDE_PATH")),
             claudio: std::env::current_exe()?,
             skip_permissions: crate::config::load().claude.allow_skip_permissions,
             // Hashed now: an upgrade may replace the file while we run.
             build: Probe::current()
                 .inspect_err(|e| tracing::warn!(error = %e, "cannot identify this binary"))
                 .ok(),
+            path,
         })
     }
-}
 
-impl Config {
-    /// The claude binary to run now. A bare name is resolved again each time:
-    /// the installer may have created `~/.local/bin/claude` since startup.
+    /// The claude binary to run now. A bare name is resolved again each time
+    /// ([`resolve_claude_path`]): an update or the installer may have put a
+    /// claude somewhere new since startup.
     pub fn claude_bin(&self) -> PathBuf {
         if self.claude.components().count() > 1 {
-            self.claude.clone()
-        } else {
-            resolve_claude_path()
+            return self.claude.clone();
         }
+        let path = self.path.clone().or_else(|| std::env::var_os("PATH"));
+        resolve_claude_path(self.claude.as_os_str(), path.as_deref(), &host::home())
     }
 }
 
-/// Resolve the `claude` binary path.
-///
-/// Non-interactive SSH shells often have a minimal PATH that omits
-/// `~/.local/bin`, `~/.npm-global/bin` and similar. We try PATH first
-/// then fall back through well-known locations so remote sessions still
-/// find `claude` without the user touching their shell profile.
-pub fn resolve_claude_path() -> PathBuf {
-    // 1. PATH lookup.
-    if let Some(p) = which_claude() {
-        return p;
-    }
-    // 2. Well-known fallback locations, checked in priority order.
-    let home = std::env::var_os("HOME")
+/// `$CLAUDIO_CLAUDE_PATH` when set (it always wins), else the bare `claude`.
+fn claude_setting(env: Option<OsString>) -> PathBuf {
+    env.filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    let candidates = [
-        home.join(".local/bin/claude"),
-        home.join(".claude/local/claude"),
-        PathBuf::from("/usr/local/bin/claude"),
-        PathBuf::from("/opt/homebrew/bin/claude"),
-        home.join(".npm-global/bin/claude"),
-    ];
-    for p in &candidates {
-        if p.is_file() {
-            return p.clone();
-        }
-    }
-    // 3. Give up — return the bare name so later PATH lookups at spawn time
-    // still have a chance.
-    PathBuf::from("claude")
+        .unwrap_or_else(|| PathBuf::from("claude"))
 }
 
-/// Search `$PATH` for `claude`.
-fn which_claude() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("claude"))
+/// Find the bare command `name` (normally `claude`): in `path` (the login
+/// shell's, see [`Config::path`]), then in well-known install locations —
+/// the user's own before system-wide ones — in case the login shell could not
+/// be read. Falls back to `name` itself, for a lookup at spawn time.
+pub fn resolve_claude_path(name: &OsStr, path: Option<&OsStr>, home: &Path) -> PathBuf {
+    let in_path = path.into_iter().flat_map(std::env::split_paths);
+    let fallbacks = [
+        home.join(".local/bin"),
+        home.join(".claude/local"),
+        home.join(".npm-packages/bin"),
+        home.join(".npm-global/bin"),
+        home.join(".bun/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+    ];
+    in_path
+        .chain(fallbacks)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
         .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 #[cfg(test)]
 mod claude_path_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("claudio-resolve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An executable `claude` in `dir`.
+    fn install(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn join(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    const ABSENT: &str = "claude-not-installed-anywhere";
 
     #[test]
-    fn resolve_returns_a_path() {
-        // Smoke test: the function must not panic, and it must return
-        // something (even if that something is the bare "claude" name).
-        let p = resolve_claude_path();
-        assert!(!p.as_os_str().is_empty());
+    fn the_login_path_comes_first() {
+        let root = scratch();
+        let home = root.join("home");
+        let mine = install(&home.join(".npm-packages/bin"));
+        let stale = install(&root.join("usr/local/bin"));
+        let (mine_dir, stale_dir) = (mine.parent().unwrap(), stale.parent().unwrap());
+        let path = join(&[mine_dir, stale_dir]);
+        assert_eq!(
+            resolve_claude_path(OsStr::new("claude"), Some(&path), &home),
+            mine
+        );
+        // Whichever comes first in the PATH wins.
+        let path = join(&[stale_dir, mine_dir]);
+        assert_eq!(
+            resolve_claude_path(OsStr::new("claude"), Some(&path), &home),
+            stale
+        );
     }
 
     #[test]
-    fn which_claude_finds_existing_binary() {
-        // If `sh` is on PATH, we can confirm which_claude works for it.
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let sh_exists = std::env::split_paths(&path).any(|d| d.join("sh").is_file());
-        if sh_exists {
-            // Not testing for claude specifically (may not exist in CI),
-            // just that the function runs without panicking.
-            let _ = which_claude();
+    fn well_known_locations_when_the_path_lacks_claude() {
+        let root = scratch();
+        let home = root.join("home");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let npm = install(&home.join(".npm-packages/bin"));
+        assert_eq!(
+            resolve_claude_path(OsStr::new("claude"), Some(&join(&[&empty])), &home),
+            npm
+        );
+        // The native installer's location ranks above npm's.
+        let native = install(&home.join(".local/bin"));
+        assert_eq!(
+            resolve_claude_path(OsStr::new("claude"), None, &home),
+            native
+        );
+    }
+
+    #[test]
+    fn missing_everywhere_is_the_bare_name() {
+        let root = scratch();
+        let got = resolve_claude_path(OsStr::new(ABSENT), Some(&join(&[&root])), &root);
+        assert_eq!(got, PathBuf::from(ABSENT));
+    }
+
+    #[test]
+    fn relative_path_entries_are_skipped() {
+        let root = scratch();
+        let path = OsString::from(".:bin");
+        let got = resolve_claude_path(OsStr::new(ABSENT), Some(&path), &root);
+        assert_eq!(got, PathBuf::from(ABSENT));
+    }
+
+    fn config(claude: PathBuf, path: Option<OsString>) -> Config {
+        Config {
+            socket: "/run/d.sock".into(),
+            lock: "/run/d.lock".into(),
+            journal: "/j.json".into(),
+            claude,
+            claudio: "/bin/claudio".into(),
+            skip_permissions: false,
+            build: None,
+            path,
         }
+    }
+
+    #[test]
+    fn claudio_claude_path_wins() {
+        let root = scratch();
+        let mine = install(&root.join("login"));
+        let pinned = install(&root.join("pinned"));
+        let path = Some(join(&[mine.parent().unwrap()]));
+        let setting = claude_setting(Some(pinned.clone().into()));
+        assert_eq!(config(setting, path.clone()).claude_bin(), pinned);
+        // Unset or empty: the bare name, looked up in the login PATH.
+        assert_eq!(claude_setting(None), PathBuf::from("claude"));
+        assert_eq!(claude_setting(Some("".into())), PathBuf::from("claude"));
+        assert_eq!(config(claude_setting(None), path).claude_bin(), mine);
+    }
+
+    #[test]
+    fn claude_bin_sees_a_claude_installed_later() {
+        let root = scratch();
+        let dir = root.join("login");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = config(PathBuf::from(ABSENT), Some(join(&[&dir])));
+        assert_eq!(cfg.claude_bin(), PathBuf::from(ABSENT));
+        std::fs::write(dir.join(ABSENT), "").unwrap();
+        assert_eq!(cfg.claude_bin(), dir.join(ABSENT));
     }
 }
 
@@ -316,9 +412,18 @@ impl Daemon {
 
     async fn probe_host(&self) -> HostInfo {
         let claude = self.config.claude_bin();
-        tokio::task::spawn_blocking(move || host::probe(&claude))
+        let path = self.config.path.clone();
+        let host = tokio::task::spawn_blocking(move || host::probe(&claude, path.as_deref()))
             .await
-            .unwrap_or_else(|_| host::basic())
+            .unwrap_or_else(|_| host::basic());
+        match &host.claude {
+            Some(c) => tracing::info!(path = %c.path, version = %c.version, "claude"),
+            None => tracing::warn!(
+                looked_for = %self.config.claude_bin().display(),
+                "claude not found (or `claude --version` failed)"
+            ),
+        }
+        host
     }
 
     /// Whether to launch claude with `--allow-dangerously-skip-permissions`:
@@ -334,7 +439,11 @@ impl Daemon {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *supported.get_or_insert_with(|| {
-            host::claude_supports(&self.config.claude_bin(), host::ALLOW_SKIP_PERMISSIONS)
+            host::claude_supports(
+                &self.config.claude_bin(),
+                host::ALLOW_SKIP_PERMISSIONS,
+                self.config.path.as_deref(),
+            )
         })
     }
 

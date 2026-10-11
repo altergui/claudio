@@ -4,6 +4,7 @@
 //! `claude --version`, so it is computed once and cached by the caller).
 //! [`list_dir`] backs the new-session directory picker.
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,10 +34,11 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-/// Gather host facts. Blocking: runs `<claude> --version` (≤ 3 s).
-pub fn probe(claude: &Path) -> HostInfo {
+/// Gather host facts. Blocking: runs `<claude> --version` (≤ 3 s), with
+/// `PATH` set to `path` when given (the daemon's login-shell `PATH`).
+pub fn probe(claude: &Path, path: Option<&OsStr>) -> HostInfo {
     HostInfo {
-        claude: claude_info(claude),
+        claude: claude_info(claude, path),
         ..basic()
     }
 }
@@ -64,11 +66,11 @@ fn hostname() -> String {
 }
 
 /// `Some` when `claude` resolves to a file and `--version` answers in time.
-fn claude_info(claude: &Path) -> Option<ClaudeInfo> {
-    let path = which(claude)?;
-    let version = run_version(&path)?;
+fn claude_info(claude: &Path, path: Option<&OsStr>) -> Option<ClaudeInfo> {
+    let bin = which(claude)?;
+    let version = run_version(&bin, path)?;
     Some(ClaudeInfo {
-        path: path.to_string_lossy().into_owned(),
+        path: bin.to_string_lossy().into_owned(),
         version,
     })
 }
@@ -85,8 +87,8 @@ fn which(cmd: &Path) -> Option<PathBuf> {
 }
 
 /// First line of `<claude> --version`, or `None` on failure or timeout.
-fn run_version(claude: &Path) -> Option<String> {
-    run_capture(claude, "--version")?
+fn run_version(claude: &Path, path: Option<&OsStr>) -> Option<String> {
+    run_capture(claude, "--version", path)?
         .lines()
         .next()
         .map(|l| l.trim().to_owned())
@@ -99,15 +101,19 @@ pub const ALLOW_SKIP_PERMISSIONS: &str = "--allow-dangerously-skip-permissions";
 
 /// Whether `<claude> --help` mentions `flag`. Blocking (≤ 3 s); `false` on
 /// failure or timeout, so an old or broken claude never gets the flag.
-pub fn claude_supports(claude: &Path, flag: &str) -> bool {
-    run_capture(claude, "--help").is_some_and(|help| help.contains(flag))
+pub fn claude_supports(claude: &Path, flag: &str, path: Option<&OsStr>) -> bool {
+    run_capture(claude, "--help", path).is_some_and(|help| help.contains(flag))
 }
 
 /// Stdout of `<claude> <arg>` when it exits 0 within [`VERSION_TIMEOUT`].
 /// Stdout is drained on a thread so long output can't fill the pipe and stall
 /// the child.
-fn run_capture(claude: &Path, arg: &str) -> Option<String> {
-    let mut child = Command::new(claude)
+fn run_capture(claude: &Path, arg: &str, path: Option<&OsStr>) -> Option<String> {
+    let mut cmd = Command::new(claude);
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    let mut child = cmd
         .arg(arg)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -215,7 +221,7 @@ mod tests {
 
     #[test]
     fn probe_reports_host_and_missing_claude() {
-        let info = probe(Path::new("/nonexistent/claude"));
+        let info = probe(Path::new("/nonexistent/claude"), None);
         assert_eq!(info.os, std::env::consts::OS);
         assert!(!info.hostname.is_empty());
         assert!(info.claude.is_none());
@@ -235,12 +241,29 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(claude_supports(&bin, ALLOW_SKIP_PERMISSIONS));
-        assert!(!claude_supports(&bin, "--no-such-flag"));
+        assert!(claude_supports(&bin, ALLOW_SKIP_PERMISSIONS, None));
+        assert!(!claude_supports(&bin, "--no-such-flag", None));
         assert!(!claude_supports(
             Path::new("/nonexistent/claude"),
-            ALLOW_SKIP_PERMISSIONS
+            ALLOW_SKIP_PERMISSIONS,
+            None
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_runs_claude_with_the_given_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("claudio-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("claude");
+        // An npm-style claude needs its interpreter from the user's PATH.
+        std::fs::write(&bin, "#!/bin/sh\necho \"$PATH\"\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let info = probe(&bin, Some(OsStr::new("/login/bin:/usr/bin:/bin")));
+        let claude = info.claude.unwrap();
+        assert_eq!(claude.version, "/login/bin:/usr/bin:/bin");
+        assert_eq!(claude.path, bin.to_string_lossy());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

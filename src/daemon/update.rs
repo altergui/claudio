@@ -6,6 +6,7 @@
 //! bounded to the last few KiB. Running sessions are never touched: they keep
 //! the binary they started with, new ones pick up the new one.
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -38,7 +39,9 @@ pub async fn run(daemon: &Daemon, install: bool) -> Msg {
             message: "a claude update is already running on this host".into(),
         };
     };
-    let (ok, tail) = match execute(&daemon.config.claude_bin(), install, TIMEOUT).await {
+    let claude = daemon.config.claude_bin();
+    let path = daemon.config.path.as_deref();
+    let (ok, tail) = match execute(&claude, install, path, TIMEOUT).await {
         Ok(done) => done,
         Err(e) => (false, e),
     };
@@ -54,9 +57,13 @@ pub async fn run(daemon: &Daemon, install: bool) -> Msg {
 /// The command runs in a process group of its own: the installer is a
 /// pipeline (`curl | bash`) whose `bash` starts more processes, and killing
 /// only `sh` on timeout would leave those running, still installing.
+///
+/// `path` (the daemon's login-shell `PATH`) is the update's `PATH`: an npm
+/// install updates itself with the user's `npm`.
 async fn execute(
     claude: &Path,
     install: bool,
+    path: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<(bool, String), String> {
     let mut cmd = Command::new("sh");
@@ -69,6 +76,9 @@ async fn execute(
     }
     for marker in SESSION_MARKERS {
         cmd.env_remove(marker);
+    }
+    if let Some(path) = path {
+        cmd.env("PATH", path);
     }
     let mut child = cmd
         .stdin(Stdio::null())
@@ -166,7 +176,7 @@ mod tests {
             .unwrap();
 
         let started = std::time::Instant::now();
-        let result = execute(&claude, false, Duration::from_millis(300)).await;
+        let result = execute(&claude, false, None, Duration::from_millis(300)).await;
         assert!(matches!(&result, Err(e) if e.contains("timed out")), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(5), "the leader was reaped promptly");
 
